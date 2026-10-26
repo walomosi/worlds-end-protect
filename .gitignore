@@ -1,12 +1,11 @@
-# 编译产物
+# Build output
 bin/
-# 生成的策略预览与临时文件
-scripts/applocker-policy.xml
-scripts/preview.txt
-# 运行期数据（位于 C:\ProgramData\GuardKit，工程外，此处兜底）
+
+# Runtime data
 *.log
 quarantine/
-# 编辑器/系统
+
+# Editor / system
 .vscode/
 .vs/
 *.user

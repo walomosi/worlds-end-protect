@@ -1,37 +1,38 @@
-// GuardCrypto.cs — GuardKit 共享模块：配置编解码 + AES-256 加密 + SHA256 完整性
-// 被 GuardApp.exe 与 GuardGui.exe 共同编译引用。
-// 设计目标：学生篡改/读取配置需要逆向 exe 提取密钥，无法"短时破解"。
-// 说明：密钥硬编码于 exe 内（自用场景下已足够；如需防专业逆向需驱动级方案，超出本工具范围）。
+// PolicyCore.cs — World's End Protect shared core
+// Config model + AES-256 encryption + SHA-256 integrity, shared by
+// StudentGuard.exe (student endpoint) and TeacherConsole.exe (teacher console).
+//
+// Line-based policy format (plain text; encrypted with AES before network send):
+//   <processName>=<fullPath>       guarded target (kept alive), repeatable
+//   PROTECT=<path>                 write-locked path, repeatable
+//   GUARDS=<exePath>               mutual-guard replica, repeatable
+//   HASH=<exePath>=<sha256>        integrity baseline, repeatable
+//   WHITELIST=<glob>               AppLocker extra allowed path, repeatable
+//   SCANPATH=<dir>                 download/watch scan dir, repeatable
+//   BAN=<processName>              banned process (killed on sight), repeatable
+//   WATCH_MS=<milliseconds>        polling interval
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 
-namespace GuardKit
+namespace WorldEndProtect
 {
-    // 行式配置模型：
-    //   <进程名>=<完整路径>          守护目标（可多行）
-    //   PROTECT=<路径>               配置保护路径（可多行）
-    //   GUARDS=<守护副本exe路径>      互守副本列表（可多行）
-    //   HASH=<exe路径>=<sha256>      完整性基准（可多行）
-    //   WHITELIST=<路径通配>          应用白名单额外允许路径（可多行，AppLocker 用）
-    //   SCANPATH=<目录>               下载监控扫描目录（可多行，默认 Downloads/Desktop/Temp）
-    //   WATCH_MS=<毫秒>               巡检间隔
     internal class GuardConfig
     {
         public Dictionary<string, string> Targets = new Dictionary<string, string>();
         public List<string> ProtectPaths = new List<string>();
         public List<string> Guards = new List<string>();
         public Dictionary<string, string> Hashes = new Dictionary<string, string>();
-        public List<string> Whitelist = new List<string>();   // AppLocker 白名单额外路径
-        public List<string> ScanPaths = new List<string>();   // 恶意文件扫描目录
+        public List<string> Whitelist = new List<string>();
+        public List<string> ScanPaths = new List<string>();
+        public List<string> Banned = new List<string>();   // processes the student endpoint must kill
         public int WatchMs = 2000;
 
-        public const string ConfigName = "config.bin";   // 加密配置（部署后）
-        public const string PlainName = "config.txt";    // 明文模板（编辑/部署前）
+        public const string ConfigName = "config.bin";   // encrypted policy on the student machine
+        public const string PlainName = "config.txt";    // plain template (editing/pre-deploy)
 
-        // 从明文文本解析
         public static GuardConfig Parse(string text)
         {
             GuardConfig c = new GuardConfig();
@@ -40,28 +41,17 @@ namespace GuardKit
                 string line = raw.Trim();
                 if (line.Length == 0 || line.StartsWith("#") || line.StartsWith("//")) continue;
                 if (line.StartsWith("PROTECT=", StringComparison.OrdinalIgnoreCase))
-                {
-                    string p = line.Substring(8).Trim().Trim('"');
-                    if (p.Length > 0) c.ProtectPaths.Add(p);
-                }
+                    Add(c.ProtectPaths, line.Substring(8));
                 else if (line.StartsWith("GUARDS=", StringComparison.OrdinalIgnoreCase))
-                {
-                    string p = line.Substring(7).Trim().Trim('"');
-                    if (p.Length > 0) c.Guards.Add(p);
-                }
+                    Add(c.Guards, line.Substring(7));
                 else if (line.StartsWith("WHITELIST=", StringComparison.OrdinalIgnoreCase))
-                {
-                    string p = line.Substring(10).Trim().Trim('"');
-                    if (p.Length > 0) c.Whitelist.Add(p);
-                }
+                    Add(c.Whitelist, line.Substring(10));
                 else if (line.StartsWith("SCANPATH=", StringComparison.OrdinalIgnoreCase))
-                {
-                    string p = line.Substring(9).Trim().Trim('"');
-                    if (p.Length > 0) c.ScanPaths.Add(p);
-                }
+                    Add(c.ScanPaths, line.Substring(9));
+                else if (line.StartsWith("BAN=", StringComparison.OrdinalIgnoreCase))
+                    Add(c.Banned, line.Substring(4));
                 else if (line.StartsWith("HASH=", StringComparison.OrdinalIgnoreCase))
                 {
-                    // HASH=<exe路径>=<sha256>
                     int eq = line.IndexOf('=', 5);
                     if (eq > 5)
                     {
@@ -90,45 +80,43 @@ namespace GuardKit
             return c;
         }
 
-        // 序列化为明文文本（模板/备份用）
+        private static void Add(List<string> list, string raw)
+        {
+            string p = raw.Trim().Trim('"');
+            if (p.Length > 0) list.Add(p);
+        }
+
         public string ToText()
         {
             StringBuilder sb = new StringBuilder();
             foreach (KeyValuePair<string, string> kv in Targets)
                 sb.AppendLine(kv.Key + "=" + kv.Value);
-            foreach (string p in ProtectPaths)
-                sb.AppendLine("PROTECT=" + p);
-            foreach (string g in Guards)
-                sb.AppendLine("GUARDS=" + g);
-            foreach (string w in Whitelist)
-                sb.AppendLine("WHITELIST=" + w);
-            foreach (string s in ScanPaths)
-                sb.AppendLine("SCANPATH=" + s);
+            foreach (string p in ProtectPaths) sb.AppendLine("PROTECT=" + p);
+            foreach (string g in Guards) sb.AppendLine("GUARDS=" + g);
+            foreach (string w in Whitelist) sb.AppendLine("WHITELIST=" + w);
+            foreach (string s in ScanPaths) sb.AppendLine("SCANPATH=" + s);
+            foreach (string b in Banned) sb.AppendLine("BAN=" + b);
             foreach (KeyValuePair<string, string> h in Hashes)
                 sb.AppendLine("HASH=" + h.Key + "=" + h.Value);
             sb.AppendLine("WATCH_MS=" + WatchMs);
             return sb.ToString();
         }
 
-        // 加载：优先加密 config.bin，无则回退明文 config.txt
+        // Load: prefer encrypted config.bin, fall back to plain config.txt
         public static GuardConfig Load(string dir)
         {
             string bin = Path.Combine(dir, ConfigName);
             if (File.Exists(bin))
             {
-                try
-                {
-                    string plain = AesBox.Decrypt(File.ReadAllText(bin).Trim());
-                    return Parse(plain);
-                }
-                catch { /* 加密配置损坏时回退明文，便于 GUI 修复 */ }
+                try { return Parse(AesBox.Decrypt(File.ReadAllText(bin).Trim())); }
+                catch { /* encrypted policy corrupt: fall through to plain text for repair */ }
             }
             string txt = Path.Combine(dir, PlainName);
             if (File.Exists(txt)) return Parse(File.ReadAllText(txt));
             return new GuardConfig();
         }
 
-        // 保存：encrypt=true 写 config.bin（并清理明文）；false 写 config.txt
+        // Save; encrypt=true writes config.bin and removes the plain template
         public void Save(string dir, bool encrypt)
         {
             Directory.CreateDirectory(dir);
@@ -145,10 +133,9 @@ namespace GuardKit
         }
     }
 
-    // AES-256-CBC 加解密。密钥/IV 以字节数组硬编码，避免明文字符串出现在二进制里。
+    // AES-256-CBC. Key/IV stored as byte arrays so no plain string appears in the binary.
     internal static class AesBox
     {
-        // 固定密钥（256 位）与 IV（128 位）——自用部署场景足够；如需对抗专业逆向请用驱动级方案
         private static readonly byte[] Key = {
             0x6E, 0x2B, 0xA1, 0xC7, 0x3D, 0x0F, 0x95, 0x58,
             0x81, 0x4C, 0xE3, 0x1A, 0xB6, 0x77, 0x02, 0xDE,
@@ -164,15 +151,12 @@ namespace GuardKit
         {
             using (Aes aes = Aes.Create())
             {
-                aes.Key = Key;
-                aes.IV = Iv;
-                aes.Mode = CipherMode.CBC;
-                aes.Padding = PaddingMode.PKCS7;
+                aes.Key = Key; aes.IV = Iv;
+                aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.PKCS7;
                 using (ICryptoTransform t = aes.CreateEncryptor())
                 {
                     byte[] data = Encoding.UTF8.GetBytes(plain);
-                    byte[] enc = t.TransformFinalBlock(data, 0, data.Length);
-                    return Convert.ToBase64String(enc);
+                    return Convert.ToBase64String(t.TransformFinalBlock(data, 0, data.Length));
                 }
             }
         }
@@ -181,21 +165,17 @@ namespace GuardKit
         {
             using (Aes aes = Aes.Create())
             {
-                aes.Key = Key;
-                aes.IV = Iv;
-                aes.Mode = CipherMode.CBC;
-                aes.Padding = PaddingMode.PKCS7;
+                aes.Key = Key; aes.IV = Iv;
+                aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.PKCS7;
                 using (ICryptoTransform t = aes.CreateDecryptor())
                 {
                     byte[] enc = Convert.FromBase64String(b64.Trim());
-                    byte[] data = t.TransformFinalBlock(enc, 0, enc.Length);
-                    return Encoding.UTF8.GetString(data);
+                    return Encoding.UTF8.GetString(t.TransformFinalBlock(enc, 0, enc.Length));
                 }
             }
         }
     }
 
-    // 文件完整性：SHA256 基准比对
     internal static class Integrity
     {
         public static string Sha256File(string path)
@@ -212,7 +192,7 @@ namespace GuardKit
             catch { return null; }
         }
 
-        // 校验给定路径是否与基准一致；缺失基准视为通过
+        // Missing baseline means "pass"
         public static bool Check(string path, string expectedHash)
         {
             if (string.IsNullOrEmpty(expectedHash)) return true;
